@@ -365,7 +365,7 @@ impl ShredProcessor {
                 let recovery_ok = match Self::recover_fec(acc, reed_solomon_cache).await {
                     Ok(()) => true,
                     Err(e) => {
-                        warn!("FEC Recovery failed (using partial data shreds): {:?}", e);
+                        // FEC recovery failed (e.g. InvalidMerkleRoot) — proceed with partial data shreds
                         false
                     }
                 };
