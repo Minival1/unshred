@@ -362,19 +362,23 @@ impl ShredProcessor {
                 }
             }
             ReconstructionStatus::ReadyRecovery => {
-                if let Err(e) = Self::recover_fec(acc, reed_solomon_cache).await {
-                    error!("FEC Recovery failed unexpectedly: {:?}", e);
-                    return Ok(());
-                }
+                let recovery_ok = match Self::recover_fec(acc, reed_solomon_cache).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!("FEC Recovery failed (using partial data shreds): {:?}", e);
+                        false
+                    }
+                };
 
                 let acc = fec_set_accumulators.remove(&fec_key).unwrap();
                 Self::send_completed_fec_set(acc, sender, fec_key, processed_fec_sets).await?;
 
                 #[cfg(feature = "metrics")]
                 if let Some(metrics) = Metrics::try_get() {
+                    let label = if recovery_ok { "recovery" } else { "recovery_partial" };
                     metrics
                         .processor_fec_sets_completed
-                        .with_label_values(&["recovery"])
+                        .with_label_values(&[label])
                         .inc();
                 }
             }
