@@ -389,26 +389,12 @@ impl ShredReceiver {
     }
 }
 
-/// Fast wall-clock in microseconds.
+/// Wall-clock in microseconds using the precise `CLOCK_REALTIME` via vDSO.
 ///
-/// On Linux we use `CLOCK_REALTIME_COARSE` (~3–5 ns via vDSO, precision ~1 ms)
-/// which is plenty for shred-arrival timestamps. Elsewhere we fall back to
-/// `SystemTime::now()`.
+/// We previously used `CLOCK_REALTIME_COARSE` but its jiffy-bound granularity
+/// (1–4 ms depending on HZ) added quantization noise to per-shred timestamps
+/// and visibly inflated the measured `processing_latency` percentiles.
 #[inline]
-#[cfg(target_os = "linux")]
-fn now_micros_coarse() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts);
-    }
-    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
-}
-
-#[inline]
-#[cfg(not(target_os = "linux"))]
 fn now_micros_coarse() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
