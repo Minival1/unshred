@@ -346,7 +346,13 @@ impl ShredReceiver {
         };
 
         // Shard by fec_set_index to keep per-FEC-set state thread-local.
-        let worker_id = (fec_set_index as usize) % num_senders;
+        //
+        // Solana's `fec_set_index` is always a multiple of 32 (one FEC set =
+        // 32 data shreds), so a naive `fec_set_index % num_senders` with
+        // num_senders ∈ {2, 4, 8, 16, 32} collapses to the same worker for
+        // every shred. Divide by 32 first so consecutive FEC sets round-robin
+        // across workers.
+        let worker_id = ((fec_set_index as usize) / 32) % num_senders;
         match senders[worker_id].try_send(raw) {
             Ok(_) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
