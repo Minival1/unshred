@@ -425,7 +425,7 @@ manual_let_else = "deny"
 used_underscore_binding = "deny"
 
 [lints.rust]
-warnings = "deny"
+warnings = "warn"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

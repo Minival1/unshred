@@ -1,12 +1,12 @@
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
-use crate::types::ShredBytesMeta;
+use crate::types::RawShred;
 
 use anyhow::Result;
 use dashmap::DashSet;
 use socket2::{Domain, Socket, Type};
+use solana_ledger::shred::ShredType;
 use std::{
-    mem::MaybeUninit,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,23 +16,51 @@ use tracing::{error, info};
 
 const SHRED_SIZE: usize = 1228;
 const RECV_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64MB
+const RECV_BATCH: usize = 64;
+
+// Header layout offsets (common shred header)
+const OFFSET_VARIANT: usize = 64;
 const OFFSET_SHRED_SLOT: usize = 65;
+const OFFSET_SHRED_INDEX: usize = 73;
 const OFFSET_FEC_SET_INDEX: usize = 79;
+// Data-shred fields
+const OFFSET_FLAGS: usize = 85;
+// Coding-shred fields (num_data_shreds at 83..85)
+const OFFSET_CODE_NUM_DATA: usize = 83;
+
+const MIN_HEADER_LEN: usize = 88;
 
 pub struct ShredReceiver {
-    socket: Arc<Socket>,
+    sockets: Vec<Arc<Socket>>,
 }
 
 impl ShredReceiver {
-    pub fn new(bind_addr: SocketAddr) -> Result<Self> {
-        // UDP socket
+    pub fn new(bind_addr: SocketAddr, num_receivers: usize) -> Result<Self> {
+        let num_receivers = num_receivers.max(1);
+        let mut sockets = Vec::with_capacity(num_receivers);
+
+        for i in 0..num_receivers {
+            let socket = Self::build_socket(bind_addr, num_receivers > 1)?;
+            info!("UDP receiver #{} bound to {}", i, bind_addr);
+            sockets.push(Arc::new(socket));
+        }
+
+        Ok(Self { sockets })
+    }
+
+    fn build_socket(bind_addr: SocketAddr, reuse_port: bool) -> Result<Socket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
 
         socket.set_reuse_address(true)?;
-        socket.set_recv_buffer_size(RECV_BUFFER_SIZE)?;
-        socket.set_nonblocking(true)?;
+        // SO_REUSEPORT is required for kernel-side flow-hash load balancing
+        // across multiple sockets bound to the same (addr, port).
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        let _ = reuse_port;
 
-        // Busy poll
+        socket.set_recv_buffer_size(RECV_BUFFER_SIZE)?;
+
+        // Busy poll (Linux only).
         #[cfg(target_os = "linux")]
         {
             use libc::{setsockopt, SOL_SOCKET, SO_BUSY_POLL};
@@ -52,32 +80,28 @@ impl ShredReceiver {
             }
         }
 
+        // Blocking reads — recvmmsg on Linux, single recv elsewhere.
+        socket.set_nonblocking(false)?;
         socket.bind(&bind_addr.into())?;
-        info!("UDP receiver bound to {}", bind_addr);
-
-        Ok(Self {
-            socket: Arc::new(socket),
-        })
+        Ok(socket)
     }
 
     pub async fn run(
         self,
-        senders: Vec<Sender<ShredBytesMeta>>,
+        senders: Vec<Sender<RawShred>>,
         processed_fec_sets: Arc<DashSet<(u64, u32)>>,
     ) -> Result<()> {
-        // Spawn receiver threads
-        let num_receivers = 1;
+        let num_receivers = self.sockets.len();
         info!("Starting {} network receiver workers", num_receivers);
         let mut handles = Vec::with_capacity(num_receivers);
 
-        for i in 0..num_receivers {
-            let socket = Arc::clone(&self.socket);
+        for (i, socket) in self.sockets.into_iter().enumerate() {
             let senders = senders.clone();
             let processed_fec_sets = Arc::clone(&processed_fec_sets);
 
             let handle = task::spawn_blocking(move || {
                 if let Err(e) = Self::receive_loop(socket, senders, processed_fec_sets) {
-                    error!("Reciever {} failed: {}", i, e);
+                    error!("Receiver {} failed: {}", i, e);
                 }
             });
             handles.push(handle);
@@ -92,46 +116,21 @@ impl ShredReceiver {
 
     fn receive_loop(
         socket: Arc<Socket>,
-        senders: Vec<Sender<ShredBytesMeta>>,
+        senders: Vec<Sender<RawShred>>,
         processed_fec_sets: Arc<DashSet<(u64, u32)>>,
     ) -> Result<()> {
         #[cfg(feature = "metrics")]
         let mut last_channel_update = std::time::Instant::now();
-        // Pre-allocate buffer
-        let mut buffer = vec![MaybeUninit::<u8>::uninit(); SHRED_SIZE];
+
+        let num_senders = senders.len();
+
+        // Pre-allocated batch buffers reused across iterations.
+        let mut batch_buffers: Vec<[u8; SHRED_SIZE]> = vec![[0u8; SHRED_SIZE]; RECV_BATCH];
+        let mut batch_sizes: [usize; RECV_BATCH] = [0; RECV_BATCH];
 
         loop {
-            match socket.recv(&mut buffer) {
-                Ok(size) if size > 0 => {
-                    let received_at_micros = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64;
-
-                    // SAFETY: socket.recv() guarantees the first `size` bytes are initialized
-                    let initialized_data =
-                        unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, size) };
-
-                    if let Err(e) = Self::process_shred(
-                        initialized_data,
-                        &senders,
-                        &processed_fec_sets,
-                        &received_at_micros,
-                    ) {
-                        error!("Receiver failed to process shred: {}", e);
-                        #[cfg(feature = "metrics")]
-                        if let Some(metrics) = Metrics::try_get() {
-                            metrics
-                                .errors
-                                .with_label_values(&["receiver", "process_shred"])
-                                .inc();
-                        }
-                    }
-                }
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
+            let n = match Self::recv_batch(&socket, &mut batch_buffers, &mut batch_sizes) {
+                Ok(n) => n,
                 Err(e) => {
                     error!("Socket receive error: {}", e);
                     #[cfg(feature = "metrics")]
@@ -142,10 +141,42 @@ impl ShredReceiver {
                             .inc();
                     }
                     std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+            };
+
+            if n == 0 {
+                continue;
+            }
+
+            let received_at_micros = now_micros_coarse();
+
+            for i in 0..n {
+                let size = batch_sizes[i];
+                if size == 0 {
+                    continue;
+                }
+                let data = &batch_buffers[i][..size];
+
+                if let Err(e) = Self::process_shred(
+                    data,
+                    &senders,
+                    num_senders,
+                    &processed_fec_sets,
+                    received_at_micros,
+                ) {
+                    // Invalid shreds are expected (garbage packets), don't log-spam.
+                    let _ = e;
+                    #[cfg(feature = "metrics")]
+                    if let Some(metrics) = Metrics::try_get() {
+                        metrics
+                            .errors
+                            .with_label_values(&["receiver", "process_shred"])
+                            .inc();
+                    }
                 }
             }
 
-            // Update metrics periodically
             #[cfg(feature = "metrics")]
             if last_channel_update.elapsed() > Duration::from_secs(1) {
                 if let Ok((buf_used, buf_size)) = Self::get_socket_buffer_stats(&socket) {
@@ -159,21 +190,98 @@ impl ShredReceiver {
                         }
                     }
                 }
-
                 last_channel_update = std::time::Instant::now();
             }
         }
     }
 
-    /// Creates ShredBytesMeta and sends through `senders`
+    /// Batched UDP receive.
+    ///
+    /// On Linux this uses `recvmmsg(2)` for up to `RECV_BATCH` packets in a
+    /// single syscall. On other platforms we fall back to a single blocking
+    /// `recv` — still correct, just slower.
+    #[cfg(target_os = "linux")]
+    fn recv_batch(
+        socket: &Socket,
+        buffers: &mut [[u8; SHRED_SIZE]],
+        sizes: &mut [usize],
+    ) -> std::io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+
+        let fd = socket.as_raw_fd();
+        let batch = buffers.len().min(sizes.len()).min(RECV_BATCH);
+
+        let mut iovecs: [libc::iovec; RECV_BATCH] = unsafe { std::mem::zeroed() };
+        let mut mmsghdrs: [libc::mmsghdr; RECV_BATCH] = unsafe { std::mem::zeroed() };
+
+        for i in 0..batch {
+            iovecs[i].iov_base = buffers[i].as_mut_ptr() as *mut libc::c_void;
+            iovecs[i].iov_len = SHRED_SIZE;
+            mmsghdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
+            mmsghdrs[i].msg_hdr.msg_iovlen = 1;
+        }
+
+        // Blocking call: returns as soon as at least one packet is available,
+        // then drains up to `batch` packets that are already queued.
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                mmsghdrs.as_mut_ptr(),
+                batch as libc::c_uint,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+
+        let n = ret as usize;
+        for i in 0..n {
+            sizes[i] = mmsghdrs[i].msg_len as usize;
+        }
+        Ok(n)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recv_batch(
+        socket: &Socket,
+        buffers: &mut [[u8; SHRED_SIZE]],
+        sizes: &mut [usize],
+    ) -> std::io::Result<usize> {
+        use std::mem::MaybeUninit;
+        // Fallback: one packet per syscall.
+        let buf = &mut buffers[0];
+        // SAFETY: [u8; N] and [MaybeUninit<u8>; N] have the same layout.
+        let uninit: &mut [MaybeUninit<u8>] = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                buf.len(),
+            )
+        };
+        match socket.recv(uninit) {
+            Ok(size) => {
+                sizes[0] = size;
+                Ok(if size > 0 { 1 } else { 0 })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Parses header fields from the raw packet and dispatches to a FEC worker.
     fn process_shred(
         buffer: &[u8],
-        senders: &[Sender<ShredBytesMeta>],
+        senders: &[Sender<RawShred>],
+        num_senders: usize,
         processed_fec_sets: &DashSet<(u64, u32)>,
-        received_at_micros: &u64,
+        received_at_micros: u64,
     ) -> Result<()> {
-        if buffer.len() < 88 {
-            // Minimum shred header size
+        if buffer.len() < MIN_HEADER_LEN {
             return Err(anyhow::anyhow!("Invalid shred size"));
         }
 
@@ -185,34 +293,69 @@ impl ShredReceiver {
                 .inc();
         }
 
-        // Parse shred header
-        let slot = u64::from_le_bytes(buffer[OFFSET_SHRED_SLOT..OFFSET_SHRED_SLOT + 8].try_into()?);
-        let fec_set_index =
-            u32::from_le_bytes(buffer[OFFSET_FEC_SET_INDEX..OFFSET_FEC_SET_INDEX + 4].try_into()?);
+        // Parse header fields from fixed offsets — cheaper than full Shred parse.
+        let variant = buffer[OFFSET_VARIANT];
+        let shred_type = if (variant & 0x80) != 0 {
+            ShredType::Data
+        } else {
+            ShredType::Code
+        };
+
+        let slot = u64::from_le_bytes(
+            buffer[OFFSET_SHRED_SLOT..OFFSET_SHRED_SLOT + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let index = u32::from_le_bytes(
+            buffer[OFFSET_SHRED_INDEX..OFFSET_SHRED_INDEX + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let fec_set_index = u32::from_le_bytes(
+            buffer[OFFSET_FEC_SET_INDEX..OFFSET_FEC_SET_INDEX + 4]
+                .try_into()
+                .unwrap(),
+        );
 
         let fec_key = (slot, fec_set_index);
         if processed_fec_sets.contains(&fec_key) {
-            return Ok(()); // Exit early
+            return Ok(());
         }
 
-        // Send ShredBytesMeta to processor
-        let worker_id = (fec_set_index as usize) % senders.len();
-        let sender = &senders[worker_id];
-        let shred_bytes_meta = ShredBytesMeta {
-            shred_bytes: Arc::new(buffer.to_vec()),
-            received_at_micros: Some(*received_at_micros),
-        };
-        match sender.try_send(shred_bytes_meta) {
-            Ok(_) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                return Err(anyhow::anyhow!("Channel full, backpressure detected"));
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Err(anyhow::anyhow!("Channel disconnected"));
+        let (data_flags, num_data_shreds) = match shred_type {
+            ShredType::Data => (buffer[OFFSET_FLAGS], None),
+            ShredType::Code => {
+                let n = u16::from_le_bytes([
+                    buffer[OFFSET_CODE_NUM_DATA],
+                    buffer[OFFSET_CODE_NUM_DATA + 1],
+                ]);
+                (0u8, Some(n))
             }
         };
 
-        Ok(())
+        // Allocate exactly once: own the packet bytes in a tight Vec.
+        let raw = RawShred {
+            bytes: buffer.to_vec(),
+            slot,
+            index,
+            fec_set_index,
+            shred_type,
+            data_flags,
+            num_data_shreds,
+            received_at_micros: Some(received_at_micros),
+        };
+
+        // Shard by fec_set_index to keep per-FEC-set state thread-local.
+        let worker_id = (fec_set_index as usize) % num_senders;
+        match senders[worker_id].try_send(raw) {
+            Ok(_) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(anyhow::anyhow!("Channel full, backpressure detected"))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow::anyhow!("Channel disconnected"))
+            }
+        }
     }
 
     #[cfg(feature = "metrics")]
@@ -226,7 +369,6 @@ impl ShredReceiver {
         let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
 
         unsafe {
-            // Get buffer size
             libc::getsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -234,8 +376,6 @@ impl ShredReceiver {
                 &mut recv_buf_size as *mut _ as *mut libc::c_void,
                 &mut len,
             );
-
-            // Get queued bytes
             libc::ioctl(fd, libc::FIONREAD, &mut recv_buf_used);
         }
 
@@ -247,4 +387,31 @@ impl ShredReceiver {
     fn get_socket_buffer_stats(_socket: &Socket) -> Result<(usize, usize)> {
         Ok((0, 0))
     }
+}
+
+/// Fast wall-clock in microseconds.
+///
+/// On Linux we use `CLOCK_REALTIME_COARSE` (~3–5 ns via vDSO, precision ~1 ms)
+/// which is plenty for shred-arrival timestamps. Elsewhere we fall back to
+/// `SystemTime::now()`.
+#[inline]
+#[cfg(target_os = "linux")]
+fn now_micros_coarse() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
+}
+
+#[inline]
+#[cfg(not(target_os = "linux"))]
+fn now_micros_coarse() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }
